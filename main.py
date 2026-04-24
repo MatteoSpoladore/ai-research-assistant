@@ -1,19 +1,20 @@
-import json
-import asyncio
-import requests
-from dotenv import load_dotenv
 import os
-
+import time
+import requests
+import json
+from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 load_dotenv()
 
-
+# --- VARIABILI D'AMBIENTE ---
+# Recuperate dal file .env (MAIL e SCHOLAR_API_KEY)
 mail = os.getenv("MAIL")
+scholar_api_key = os.getenv("SCHOLAR_API_KEY")
 
 
-# --- PYDANTIC MODELS (Con istruzioni Anti-Allucinazione) ---
+# --- MODELLI PYDANTIC ---
 class Paper(BaseModel):
     title: str = Field(
         description="EXTRACT EXACTLY from the provided 'RETRIEVED PAPERS' text. DO NOT INVENT."
@@ -25,7 +26,7 @@ class Paper(BaseModel):
     venue: str | None = Field(default=None)
     url: str | None = Field(default=None)
     relevance: str = Field(
-        description="Explain why this specific paper from the retrieved list is relevant to the topic."
+        description="Explain why this specific paper from the retrieved list is relevant."
     )
 
 
@@ -35,17 +36,14 @@ class Formula(BaseModel):
         description="LaTex source for the formula, no surroundings delimiters"
     )
     description: str
-    reference: str | None = Field(
-        default=None,
-        description="Paper, textbook or source where the formula comes from.",
-    )
+    reference: str | None = Field(default=None, description="Source paper or textbook.")
 
 
 class Trend(BaseModel):
     title: str
     description: str
     references: list[str] = Field(
-        default_factory=list, description="Titles or URLs of papers backing this trend."
+        default_factory=list, description="Titles or URLs backing this trend."
     )
 
 
@@ -54,135 +52,123 @@ class Report(BaseModel):
     research_questions: list[str]
     time_frame: str | None = None
     papers: list[Paper] = Field(
-        description="5 to 10 most relevant papers strictly from the provided list."
+        description="5 to 10 papers strictly from the provided list."
     )
     formulas: list[Formula]
     trends: list[Trend]
 
 
-# --- FUNZIONE PER SEMANTIC SCHOLAR ---
-def fetch_real_papers(query: str, limit: int = 10) -> str:
-    """Cerca paper reali su Semantic Scholar e formatta i risultati come stringa per l'LLM."""
-    print("⏳ Contattando Semantic Scholar per scaricare paper reali...")
+# --- LOGICA DI ESTRAZIONE DATI REALI ---
+def fetch_real_papers(query: str, limit: int = 3) -> str:
     url = "https://api.semanticscholar.org/graph/v1/paper/search"
     params = {
         "query": query,
         "limit": limit,
         "fields": "title,authors,year,venue,url,abstract",
     }
+    headers = {
+        "User-Agent": f"AcademicResearchScript/1.0 (mailto:{mail})",
+        "x-api-key": scholar_api_key,
+    }
 
-    # INTESTAZIONE OBBLIGATORIA: Inserisci la tua email qui
-    headers = {"User-Agent": f"AcademicResearchScript/1.0 (mailto:{mail})"}
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json().get("data", [])
+                if not data:
+                    return "VUOTO"
 
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-
-        if response.status_code == 429:
-            return "ERRORE_429"
-        elif response.status_code != 200:
-            return f"ERRORE_GENERICO: {response.status_code}"
-
-        data = response.json().get("data", [])
-        if not data:
-            return "VUOTO"
-
-        # Formattazione dati per l'LLM
-        context_text = ""
-        for i, paper in enumerate(data):
-            authors = [author.get("name") for author in paper.get("authors", [])]
-            context_text += f"\n--- Paper {i+1} ---\n"
-            context_text += f"Title: {paper.get('title')}\n"
-            context_text += f"Authors: {', '.join(authors)}\n"
-            context_text += f"Year: {paper.get('year')}\n"
-            context_text += f"Venue: {paper.get('venue')}\n"
-            context_text += f"URL: {paper.get('url')}\n"
-            context_text += (
-                f"Abstract: {paper.get('abstract', 'Nessun abstract disponibile.')}\n"
-            )
-
-        return context_text
-
-    except requests.exceptions.RequestException as e:
-        return f"ERRORE_CONNESSIONE: {e}"
+                context = ""
+                for i, p in enumerate(data):
+                    auths = [a.get("name") for a in p.get("authors", [])]
+                    context += f"\n--- Paper {i+1} ---\nTitle: {p.get('title')}\nAuthors: {', '.join(auths)}\n"
+                    context += f"Year: {p.get('year')}\nVenue: {p.get('venue')}\nURL: {p.get('url')}\n"
+                    context += f"Abstract: {p.get('abstract', 'N/A')}\n"
+                return context
+            elif response.status_code == 429:
+                wait = 2**attempt
+                time.sleep(wait)
+                continue
+            else:
+                return f"ERRORE_{response.status_code}"
+        except Exception as e:
+            return f"ERRORE_CONNESSIONE: {e}"
+    return "ERRORE_429"
 
 
-# --- MAIN ---
-async def main():
-    topic = input("What is the topic for the paper / thesis: ").strip()
-    questions = input("What are the key research questions: ").strip()
-    timeframe = input("What time frame should the papers be from: ").strip()
+# --- LOGICA LLM (CHIAMATA DA STREAMLIT O TERMINALE) ---
+def generate_academic_report(
+    topic: str, questions: str, timeframe: str
+) -> Report | str:
+    # 1. Recupero dati veri
+    context = fetch_real_papers(topic, limit=3)
+    if "ERRORE" in context:
+        return f"Errore nel recupero dati: {context}"
+    if context == "VUOTO":
+        return "Nessun risultato trovato."
 
-    # 1. Recupero dei dati reali
-    real_papers_context = fetch_real_papers(topic, limit=10)
-
-    # BLOCCO DI SICUREZZA: Controlliamo che l'API non abbia restituito errori
-    if real_papers_context == "ERRORE_429":
-        print(
-            "❌ Impossibile procedere: Semantic Scholar ha bloccato la richiesta (Errore 429 - Limite superato)."
-        )
-        return
-    elif real_papers_context.startswith("ERRORE"):
-        print(f"❌ Impossibile procedere: {real_papers_context}")
-        return
-    elif real_papers_context == "VUOTO":
-        print(
-            "⚠️ Nessun paper trovato per questa ricerca. Prova a usare parole chiave più generiche."
-        )
-        return
-
-    print("✅ Dati scaricati con successo! Passo il testo all'LLM...")
-
-    # 2. Creazione del task per l'LLM inserendo i dati reali come contesto
-    # 2. Creazione del task per l'LLM: Modalità ESTRAZIONE, non generazione
+    # 2. Definizione del Task
     task = f"""
---- START OF RETRIEVED REAL PAPERS ---
-{real_papers_context}
---- END OF RETRIEVED REAL PAPERS ---
+    --- START OF RETRIEVED REAL PAPERS ---
+    {context}
+    --- END OF RETRIEVED REAL PAPERS ---
 
-TOPIC: {topic}
-RESEARCH QUESTIONS: {questions}
-TIME FRAME: {timeframe or "no specific focus"}
+    TOPIC: {topic}
+    RESEARCH QUESTIONS: {questions}
+    TIME FRAME: {timeframe}
 
-CRITICAL INSTRUCTIONS FOR JSON EXTRACTION:
-1. DO NOT GATHER OR INVENT ANY PAPERS. 
-2. You must EXACTLY COPY the papers listed in the "START OF RETRIEVED REAL PAPERS" section above into the JSON schema.
-3. If the retrieved papers section is empty or has fewer than 5 papers, just output the ones available. DO NOT add fake ones to reach 10.
-4. Read the abstracts to identify trends and fill the 'relevance' field.
-5. If a formula is mentioned in the abstracts, extract it. If not, use your general knowledge to provide 1 or 2 fundamental formulas related to the TOPIC.
-"""
+    INSTRUCTIONS: Map the data above into the JSON schema. DO NOT invent papers.
+    """
 
-    # 3. Configurazione del modello locale
-    print("🧠 Elaborazione dei paper e generazione del report con LM Studio...")
+    # 3. Chiamata LLM
     llm = ChatOpenAI(
         base_url="http://localhost:1234/v1",
         api_key="lm-studio",
         model="local-model",
         temperature=0.1,
     )
+    model = llm.with_structured_output(Report)
 
-    model_with_structure = llm.with_structured_output(Report)
-
-    # 4. Invocazione del modello
     try:
-        result = model_with_structure.invoke(
+        result = model.invoke(
             [
                 {
                     "role": "system",
-                    "content": "You are a strict data extraction parser. Your ONLY job is to take the text provided by the user and map it into the requested JSON schema. NEVER invent academic papers.",
+                    "content": "You are a strict JSON extractor. Never invent data.",
                 },
                 {"role": "user", "content": task},
             ]
         )
 
-        if result:
-            print("\n✅ Report Generato con Successo:\n")
-            print(json.dumps(result.model_dump(), indent=2))
+        # Risoluzione per il controllo dei tipi (Linter)
+        if isinstance(result, Report):
+            return result
+        elif isinstance(result, dict):
+            # Se LangChain restituisce un dizionario, lo "castiamo" manualmente a Report
+            return Report(**result)
         else:
-            print("❌ Errore: Il modello non è riuscito a generare un JSON valido.")
+            return "Errore: L'LLM ha restituito un formato non riconosciuto."
 
     except Exception as e:
-        print(f"❌ Si è verificato un errore durante la chiamata all'LLM: {e}")
+        return f"Errore LLM: {e}"
 
 
+# --- BLOCCO DI DEBUG PER TERMINALE ---
+# Questo viene eseguito SOLO se lanci 'python main.py'
 if __name__ == "__main__":
-    asyncio.run(main())
+    print("\n--- 🧪 MODALITÀ DEBUG TERMINALE ---")
+    t = input("Inserisci Topic: ").strip()
+    q = input("Inserisci Domanda: ").strip()
+    tf = input("Inserisci Timeframe: ").strip()
+
+    print("\n🚀 Avvio elaborazione...")
+    report = generate_academic_report(t, q, tf)
+
+    if isinstance(report, str):
+        print(f"\n❌ Errore riscontrato: {report}")
+    else:
+        print("\n✅ Report Generato con Successo (JSON):")
+        print(json.dumps(report.model_dump(), indent=2))
+    print("\n--- Fine Debug ---")
